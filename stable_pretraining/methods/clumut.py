@@ -46,10 +46,8 @@ def _build_projector(in_dim: int, hidden_dims: Sequence[int]) -> nn.Module:
     layers = []
     previous_dim = in_dim
     for index, dim in enumerate(hidden_dims):
-        is_last = index == len(hidden_dims) - 1
         layers.append(nn.Linear(previous_dim, dim, bias=False))
-        if not is_last:
-            layers.extend((nn.BatchNorm1d(dim), nn.ReLU(inplace=True)))
+        layers.extend((nn.BatchNorm1d(dim), nn.ReLU(inplace=True)))
         previous_dim = dim
     return nn.Sequential(*layers)
 
@@ -76,12 +74,12 @@ class CluMuT(Module):
 
     def __init__(
         self,
-        encoder_name: Union[str, nn.Module] = "vit_small_patch16_224",
-        projector_dims: Sequence[int] = (2048, 256),
-        n_prototypes: int = 1000,
+        encoder_name: Union[str, nn.Module] = "resnet18",
+        projector_dims: Sequence[int] = (1024, 1024),
+        n_prototypes: int = 1024,
         temperature: float = 0.1,
-        lambd: float = 0.005,
-        low_resolution: bool = False,
+        lambd: float = 1.0,
+        low_resolution: bool = True,
         pretrained: bool = False,
         optim: Optional[dict] = None,
     ):
@@ -210,4 +208,3 @@ class CluMuT(Module):
             "mutual_targeting_loss": output.mutual_targeting_loss,
             "identitization_loss": output.identitization_loss,
         }
-
