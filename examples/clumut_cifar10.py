@@ -6,6 +6,7 @@ Use ``--max-epochs 1 --limit-train-batches 5`` for a short smoke run.
 
 import argparse
 from functools import partial
+from pathlib import Path
 
 import lightning as pl
 import torch
@@ -41,6 +42,30 @@ class SingleViewTransform:
         return {"image": self.transform(sample["image"]), "label": sample["label"]}
 
 
+class EncoderCheckpointCallback(pl.Callback):
+    """Save encoder-only snapshots at fixed pretraining epoch intervals."""
+
+    def __init__(self, directory: Path, interval: int):
+        self.directory = directory
+        self.interval = interval
+        self.saved_checkpoints = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        if epoch % self.interval != 0 and epoch != trainer.max_epochs:
+            return
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"encoder_epoch_{epoch:03d}.pt"
+        state = {
+            name: value.detach().cpu()
+            for name, value in pl_module.backbone.state_dict().items()
+        }
+        torch.save(state, path)
+        self.saved_checkpoints.append((epoch, path))
+        print(f"Saved encoder checkpoint: {path}")
+
+
 def extract_features(encoder, loader, device):
     """Extract frozen encoder features and labels to CPU tensors."""
     features = []
@@ -54,15 +79,16 @@ def extract_features(encoder, loader, device):
     return torch.cat(features), torch.cat(labels)
 
 
-def linear_evaluate(model, train_loader, test_loader, device, epochs, log_every):
+def linear_evaluate(
+    encoder, train_loader, test_loader, device, epochs, log_every, pretrain_epoch, seed
+):
     """Train a linear classifier on frozen features and periodically report test accuracy."""
     if log_every < 1:
         raise ValueError("linear_eval_log_every must be positive")
-    model.backbone.requires_grad_(False)
-    train_features, train_labels = extract_features(
-        model.backbone, train_loader, device
-    )
-    test_features, test_labels = extract_features(model.backbone, test_loader, device)
+    torch.manual_seed(seed)
+    encoder.requires_grad_(False)
+    train_features, train_labels = extract_features(encoder, train_loader, device)
+    test_features, test_labels = extract_features(encoder, test_loader, device)
     classifier = nn.Linear(train_features.shape[1], 10).to(device)
     optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -90,7 +116,8 @@ def linear_evaluate(model, train_loader, test_loader, device, epochs, log_every)
                     correct += (predictions == labels).sum().item()
             accuracy = correct / len(test_labels)
             print(
-                f"Linear eval epoch {epoch + 1}/{epochs}: "
+                f"Pretraining epoch {pretrain_epoch} | "
+                f"linear eval epoch {epoch + 1}/{epochs}: "
                 f"CIFAR-10 test top-1 accuracy: {accuracy:.4%}"
             )
 
@@ -103,9 +130,15 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--linear-eval-epochs", type=int, default=100)
     parser.add_argument("--linear-eval-log-every", type=int, default=10)
+    parser.add_argument("--checkpoint-every", type=int, default=50)
+    parser.add_argument("--checkpoint-dir", default="./clumut_checkpoints")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--accelerator", default="auto")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.checkpoint_every < 1:
+        parser.error("--checkpoint-every must be positive")
+    pl.seed_everything(args.seed, workers=True)
 
     transform = transforms.Compose(
         [
@@ -166,12 +199,17 @@ def main():
             "interval": "step",
         },
     )
+    checkpoint_dir = Path(args.checkpoint_dir) / f"batch_size_{args.batch_size}"
+    checkpoint_callback = EncoderCheckpointCallback(
+        checkpoint_dir, args.checkpoint_every
+    )
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         limit_train_batches=(
             args.limit_train_batches if args.limit_train_batches is not None else 1.0
         ),
         accelerator=args.accelerator,
+        callbacks=[checkpoint_callback],
     )
     trainer.fit(model, train_dataloaders=loader)
 
@@ -204,14 +242,21 @@ def main():
             num_workers=args.num_workers,
         )
         device = next(model.backbone.parameters()).device
-        linear_evaluate(
-            model,
-            train_eval_loader,
-            test_eval_loader,
-            device,
-            args.linear_eval_epochs,
-            args.linear_eval_log_every,
-        )
+        for pretrain_epoch, checkpoint_path in checkpoint_callback.saved_checkpoints:
+            encoder_state = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=True
+            )
+            model.backbone.load_state_dict(encoder_state)
+            linear_evaluate(
+                model.backbone,
+                train_eval_loader,
+                test_eval_loader,
+                device,
+                args.linear_eval_epochs,
+                args.linear_eval_log_every,
+                pretrain_epoch,
+                args.seed,
+            )
 
 
 if __name__ == "__main__":
