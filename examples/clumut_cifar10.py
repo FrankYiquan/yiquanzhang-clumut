@@ -13,7 +13,6 @@ import lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -66,6 +65,24 @@ class EncoderCheckpointCallback(pl.Callback):
         torch.save(state, path)
         self.saved_checkpoints.append((epoch, path))
         print(f"Saved encoder checkpoint: {path}")
+
+
+class TrainingCheckpointCallback(pl.Callback):
+    """Save one rolling full checkpoint for resuming training."""
+
+    def __init__(self, directory: Path, interval: int):
+        self.directory = directory
+        self.interval = interval
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        if epoch % self.interval != 0 and epoch != trainer.max_epochs:
+            return
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / "last.ckpt"
+        trainer.save_checkpoint(str(path))
+        print(f"Saved resumable training checkpoint: {path}")
 
 
 def extract_features(encoder, loader, device):
@@ -230,12 +247,8 @@ def main():
         checkpoint_callback = EncoderCheckpointCallback(
             checkpoint_dir, args.checkpoint_every
         )
-        training_checkpoint_callback = ModelCheckpoint(
-            dirpath=checkpoint_dir,
-            filename="clumut-epoch{epoch:03d}",
-            every_n_epochs=args.checkpoint_every,
-            save_top_k=0,
-            save_last=True,
+        training_checkpoint_callback = TrainingCheckpointCallback(
+            checkpoint_dir, args.checkpoint_every
         )
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
