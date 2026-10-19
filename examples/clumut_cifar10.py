@@ -13,6 +13,7 @@ import lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -229,7 +230,7 @@ def main():
         checkpoint_callback = EncoderCheckpointCallback(
             checkpoint_dir, args.checkpoint_every
         )
-        training_checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        training_checkpoint_callback = ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename="clumut-epoch{epoch:03d}",
             every_n_epochs=args.checkpoint_every,
