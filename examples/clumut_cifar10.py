@@ -5,6 +5,7 @@ Use ``--max-epochs 1 --limit-train-batches 5`` for a short smoke run.
 """
 
 import argparse
+import re
 from functools import partial
 from pathlib import Path
 
@@ -132,12 +133,18 @@ def main():
     parser.add_argument("--linear-eval-log-every", type=int, default=10)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--checkpoint-dir", default="./clumut_checkpoints")
+    parser.add_argument(
+        "--encoder-checkpoint",
+        help="Evaluate a saved encoder without running self-supervised pretraining.",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.checkpoint_every < 1:
         parser.error("--checkpoint-every must be positive")
+    if args.encoder_checkpoint and args.linear_eval_epochs < 1:
+        parser.error("--linear-eval-epochs must be positive with --encoder-checkpoint")
     pl.seed_everything(args.seed, workers=True)
 
     transform = transforms.Compose(
@@ -156,33 +163,27 @@ def main():
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
         ]
     )
-    dataset = spt.data.HFDataset(
-        "uoft-cs/cifar10",
-        split="train",
-        cache_dir=args.data_root,
-        rename_columns={"img": "image"},
-        transform=TwoViewTransform(transform),
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,
-    )
+    optim = None
+    if not args.encoder_checkpoint:
+        dataset = spt.data.HFDataset(
+            "uoft-cs/cifar10",
+            split="train",
+            cache_dir=args.data_root,
+            rename_columns={"img": "image"},
+            transform=TwoViewTransform(transform),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            drop_last=True,
+        )
 
-    steps_per_epoch = len(loader)
-    total_steps = max(2, steps_per_epoch * args.max_epochs)
-    warmup_steps = min(steps_per_epoch * 10, total_steps - 1)
-
-    model = spt.CluMuT(
-        encoder_name="resnet18",
-        low_resolution=True,
-        projector_dims=(1024, 1024),
-        n_prototypes=1024,
-        temperature=0.1,
-        lambd=1.0,
-        optim={
+        steps_per_epoch = len(loader)
+        total_steps = max(2, steps_per_epoch * args.max_epochs)
+        warmup_steps = min(steps_per_epoch * 10, total_steps - 1)
+        optim = {
             "optimizer": partial(
                 spt.optim.LARS,
                 lr=0.5,
@@ -197,21 +198,45 @@ def main():
                 "eta_min": 0.0005,
             },
             "interval": "step",
-        },
+        }
+
+    model = spt.CluMuT(
+        encoder_name="resnet18",
+        low_resolution=True,
+        projector_dims=(1024, 1024),
+        n_prototypes=1024,
+        temperature=0.1,
+        lambd=1.0,
+        optim=optim,
     )
     checkpoint_dir = Path(args.checkpoint_dir) / f"batch_size_{args.batch_size}"
-    checkpoint_callback = EncoderCheckpointCallback(
-        checkpoint_dir, args.checkpoint_every
-    )
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        limit_train_batches=(
-            args.limit_train_batches if args.limit_train_batches is not None else 1.0
-        ),
-        accelerator=args.accelerator,
-        callbacks=[checkpoint_callback],
-    )
-    trainer.fit(model, train_dataloaders=loader)
+    evaluation_checkpoints = []
+    if args.encoder_checkpoint:
+        checkpoint_path = Path(args.encoder_checkpoint)
+        if not checkpoint_path.is_file():
+            parser.error(f"encoder checkpoint does not exist: {checkpoint_path}")
+        match = re.search(r"encoder_epoch_(\d+)\.pt$", checkpoint_path.name)
+        if match is None:
+            parser.error(
+                "--encoder-checkpoint filename must follow encoder_epoch_NNN.pt"
+            )
+        evaluation_checkpoints.append((int(match.group(1)), checkpoint_path))
+    else:
+        checkpoint_callback = EncoderCheckpointCallback(
+            checkpoint_dir, args.checkpoint_every
+        )
+        trainer = pl.Trainer(
+            max_epochs=args.max_epochs,
+            limit_train_batches=(
+                args.limit_train_batches
+                if args.limit_train_batches is not None
+                else 1.0
+            ),
+            accelerator=args.accelerator,
+            callbacks=[checkpoint_callback],
+        )
+        trainer.fit(model, train_dataloaders=loader)
+        evaluation_checkpoints = checkpoint_callback.saved_checkpoints
 
     if args.linear_eval_epochs > 0:
         linear_transform = SingleViewTransform(evaluation_transform)
@@ -241,8 +266,13 @@ def main():
             shuffle=False,
             num_workers=args.num_workers,
         )
-        device = next(model.backbone.parameters()).device
-        for pretrain_epoch, checkpoint_path in checkpoint_callback.saved_checkpoints:
+        use_cuda = args.accelerator in ("gpu", "cuda") or (
+            args.accelerator == "auto" and torch.cuda.is_available()
+        )
+        use_mps = args.accelerator == "mps" and torch.backends.mps.is_available()
+        device = torch.device("cuda" if use_cuda else "mps" if use_mps else "cpu")
+        model.backbone.to(device)
+        for pretrain_epoch, checkpoint_path in evaluation_checkpoints:
             encoder_state = torch.load(
                 checkpoint_path, map_location="cpu", weights_only=True
             )
