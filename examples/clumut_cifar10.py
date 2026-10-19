@@ -131,8 +131,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--linear-eval-epochs", type=int, default=100)
     parser.add_argument("--linear-eval-log-every", type=int, default=10)
-    parser.add_argument("--checkpoint-every", type=int, default=50)
+    parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--checkpoint-dir", default="./clumut_checkpoints")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        help="Resume CluMuT training from a Lightning .ckpt checkpoint.",
+    )
     parser.add_argument(
         "--encoder-checkpoint",
         help="Evaluate a saved encoder without running self-supervised pretraining.",
@@ -225,6 +229,13 @@ def main():
         checkpoint_callback = EncoderCheckpointCallback(
             checkpoint_dir, args.checkpoint_every
         )
+        training_checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="clumut-epoch{epoch:03d}",
+            every_n_epochs=args.checkpoint_every,
+            save_top_k=0,
+            save_last=True,
+        )
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
             limit_train_batches=(
@@ -233,9 +244,13 @@ def main():
                 else 1.0
             ),
             accelerator=args.accelerator,
-            callbacks=[checkpoint_callback],
+            callbacks=[checkpoint_callback, training_checkpoint_callback],
         )
-        trainer.fit(model, train_dataloaders=loader)
+        trainer.fit(
+            model,
+            train_dataloaders=loader,
+            ckpt_path=args.resume_from_checkpoint,
+        )
         evaluation_checkpoints = checkpoint_callback.saved_checkpoints
 
     if args.linear_eval_epochs > 0:
