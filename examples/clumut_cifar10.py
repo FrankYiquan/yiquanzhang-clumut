@@ -324,6 +324,7 @@ def main():
                 lr=0.5,
                 momentum=0.9,
                 weight_decay=1e-4,
+                exclude_bias_n_norm=True,
             ),
             "scheduler": {
                 "type": "LinearWarmupCosineAnnealingLR",
