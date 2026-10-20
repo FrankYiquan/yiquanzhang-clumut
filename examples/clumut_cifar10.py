@@ -85,6 +85,99 @@ class TrainingCheckpointCallback(pl.Callback):
         print(f"Saved resumable training checkpoint: {path}")
 
 
+class CluMuTDiagnosticsCallback(pl.Callback):
+    """Report CluMuT loss, assignment, correlation, and gradient diagnostics."""
+
+    def __init__(self, log_every: int = 100, initial_batches: int = 3):
+        self.log_every = log_every
+        self.initial_batches = initial_batches
+        self.gradient_squared_norms = {}
+        self.hooks = []
+
+    def on_fit_start(self, trainer, pl_module):
+        def capture_gradient(name):
+            def hook(gradient):
+                squared_norm = gradient.detach().float().square().sum()
+                self.gradient_squared_norms[name] = (
+                    self.gradient_squared_norms.get(name, 0.0) + squared_norm
+                )
+
+            return hook
+
+        for name, parameter in pl_module.projector.named_parameters():
+            self.hooks.append(parameter.register_hook(capture_gradient("projector")))
+        self.hooks.append(
+            pl_module.prototypes.register_hook(capture_gradient("prototypes"))
+        )
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self.gradient_squared_norms.clear()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not isinstance(outputs, dict):
+            return
+
+        epoch = trainer.current_epoch + 1
+        step = trainer.global_step
+        mutual = outputs["mutual_targeting_loss"]
+        identitization = outputs["identitization_loss"]
+        total = outputs["loss"]
+        h_a, h_b = outputs["h_a"], outputs["h_b"]
+        q_a, q_b = outputs["q_a"], outputs["q_b"]
+        correlation = outputs["correlation"]
+
+        finite_losses = torch.isfinite(torch.stack((mutual, identitization, total)))
+        if not finite_losses.all():
+            print(f"WARNING epoch={epoch} step={step}: non-finite CluMuT loss")
+        if not torch.isfinite(q_a).all() or not torch.isfinite(q_b).all():
+            print(f"WARNING epoch={epoch} step={step}: non-finite assignments")
+        if correlation is not None and not torch.isfinite(correlation).all():
+            print(f"WARNING epoch={epoch} step={step}: non-finite correlation matrix")
+
+        entropy_a = -(q_a * q_a.clamp_min(torch.finfo(q_a.dtype).tiny).log()).sum(-1)
+        entropy_b = -(q_b * q_b.clamp_min(torch.finfo(q_b.dtype).tiny).log()).sum(-1)
+        concentration_a = (q_a.max(dim=-1).values >= 0.99).float().mean()
+        concentration_b = (q_b.max(dim=-1).values >= 0.99).float().mean()
+        if min(entropy_a.mean().item(), entropy_b.mean().item()) < 0.1:
+            print(f"WARNING epoch={epoch} step={step}: assignment entropy is very low")
+        if max(concentration_a.item(), concentration_b.item()) >= 0.9:
+            print(
+                f"WARNING epoch={epoch} step={step}: most samples assign >=99% "
+                "probability to one prototype"
+            )
+
+        should_log = step <= self.initial_batches or step % self.log_every == 0
+        if not should_log:
+            return
+
+        diagonal_mean = correlation.diagonal().mean().item()
+        off_diagonal_mask = ~torch.eye(
+            correlation.shape[0], device=correlation.device, dtype=torch.bool
+        )
+        off_diagonal_mean = correlation[off_diagonal_mask].abs().mean().item()
+        gradient_norms = {
+            name: squared_norm.sqrt().item()
+            for name, squared_norm in self.gradient_squared_norms.items()
+        }
+        print(
+            f"CluMuT diagnostic epoch={epoch} step={step} "
+            f"batch={q_a.shape[0]} mutual={mutual.item():.6g} "
+            f"identitization={identitization.item():.6g} total={total.item():.6g} "
+            f"h_a={tuple(h_a.shape)} h_b={tuple(h_b.shape)} "
+            f"q_a={tuple(q_a.shape)} q_b={tuple(q_b.shape)} "
+            f"q_a_range=({q_a.min().item():.4g},{q_a.max().item():.4g}) "
+            f"q_b_range=({q_b.min().item():.4g},{q_b.max().item():.4g}) "
+            f"entropy=({entropy_a.mean().item():.4g},{entropy_b.mean().item():.4g}) "
+            f"corr_diag={diagonal_mean:.4g} "
+            f"corr_offdiag_abs={off_diagonal_mean:.4g} "
+            f"grad_norms={gradient_norms}"
+        )
+
+    def on_fit_end(self, trainer, pl_module):
+        for hook in self.hooks:
+            hook.remove()
+
+
 def extract_features(encoder, loader, device):
     """Extract frozen encoder features and labels to CPU tensors."""
     features = []
@@ -111,6 +204,9 @@ def linear_evaluate(
     classifier = nn.Linear(train_features.shape[1], 10).to(device)
     optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    best_accuracy = 0.0
+    best_epoch = 0
+    final_accuracy = None
 
     for epoch in range(epochs):
         classifier.train()
@@ -134,11 +230,23 @@ def linear_evaluate(
                     predictions = classifier(features.to(device)).argmax(dim=1).cpu()
                     correct += (predictions == labels).sum().item()
             accuracy = correct / len(test_labels)
+            final_accuracy = accuracy
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_epoch = epoch + 1
             print(
                 f"Pretraining epoch {pretrain_epoch} | "
                 f"linear eval epoch {epoch + 1}/{epochs}: "
-                f"CIFAR-10 test top-1 accuracy: {accuracy:.4%}"
+                f"CIFAR-10 test top-1 accuracy: {accuracy:.4%} | "
+                f"best so far: {best_accuracy:.4%} at epoch {best_epoch}"
             )
+
+    if final_accuracy is not None:
+        print(
+            f"Pretraining epoch {pretrain_epoch} | linear evaluation complete: "
+            f"best test top-1 accuracy {best_accuracy:.4%} at epoch {best_epoch}; "
+            f"final test top-1 accuracy {final_accuracy:.4%}"
+        )
 
 
 def main():
@@ -162,6 +270,11 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print loss, assignment, correlation, and gradient diagnostics.",
+    )
     args = parser.parse_args()
     if args.checkpoint_every < 1:
         parser.error("--checkpoint-every must be positive")
@@ -250,6 +363,9 @@ def main():
         training_checkpoint_callback = TrainingCheckpointCallback(
             checkpoint_dir, args.checkpoint_every
         )
+        callbacks = [checkpoint_callback, training_checkpoint_callback]
+        if args.diagnostics:
+            callbacks.append(CluMuTDiagnosticsCallback())
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
             limit_train_batches=(
@@ -258,7 +374,7 @@ def main():
                 else 1.0
             ),
             accelerator=args.accelerator,
-            callbacks=[checkpoint_callback, training_checkpoint_callback],
+            callbacks=callbacks,
         )
         trainer.fit(
             model,

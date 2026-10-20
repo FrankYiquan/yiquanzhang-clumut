@@ -162,10 +162,12 @@ class CluMuT(Module):
             projection_b = self.projector(embedding_b)
             h_a, q_a = self._assign(projection_a)
             h_b, q_b = self._assign(projection_b)
-            mutual_loss = self.clumut_loss.mutual_targeting_loss(q_a, q_b)
-            identitization_loss = self.clumut_loss.identitization_loss(h_a, h_b)
-            loss = mutual_loss + identitization_loss
             correlation = self.clumut_loss.correlation(h_a, h_b)
+            mutual_loss = self.clumut_loss.mutual_targeting_loss(q_a, q_b)
+            identitization_loss = self.clumut_loss.identitization_loss(
+                h_a, h_b, correlation=correlation
+            )
+            loss = mutual_loss + identitization_loss
             output = CluMuTOutput(
                 loss=loss,
                 embedding=torch.cat((embedding_a, embedding_b), dim=0),
@@ -207,4 +209,5 @@ class CluMuT(Module):
             "q_b": output.q_b,
             "mutual_targeting_loss": output.mutual_targeting_loss,
             "identitization_loss": output.identitization_loss,
+            "correlation": output.correlation,
         }

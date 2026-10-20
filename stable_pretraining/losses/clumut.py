@@ -14,6 +14,10 @@ class CluMuTLoss(nn.Module):
         eps: Minimum denominator used when computing correlations.
 
     Note:
+        The mutual-targeting KL terms are summed over batch elements and
+        prototypes to match the paper's displayed batch objective. Compared
+        with ``batchmean``, this scales the mutual-targeting term linearly
+        with batch size; the identitization term is unchanged.
         Correlations require at least two examples per view. Constant cluster
         dimensions are assigned zero correlation, keeping the loss finite.
     """
@@ -34,8 +38,8 @@ class CluMuTLoss(nn.Module):
         log_q_a = q_a.clamp_min(torch.finfo(q_a.dtype).tiny).log()
         log_q_b = q_b.clamp_min(torch.finfo(q_b.dtype).tiny).log()
         return 0.5 * (
-            F.kl_div(log_q_a, q_b.detach(), reduction="batchmean")
-            + F.kl_div(log_q_b, q_a.detach(), reduction="batchmean")
+            F.kl_div(log_q_a, q_b.detach(), reduction="sum")
+            + F.kl_div(log_q_b, q_a.detach(), reduction="sum")
         )
 
     def correlation(self, h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
@@ -56,12 +60,14 @@ class CluMuTLoss(nn.Module):
         return numerator / denominator
 
     def identitization_loss(
-        self, h_a: torch.Tensor, h_b: torch.Tensor
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        correlation: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Match scaled cluster cross-correlations to an identity matrix."""
-        corr = self.correlation(h_a, h_b)
+        corr = self.correlation(h_a, h_b) if correlation is None else correlation
         identity = torch.eye(corr.shape[0], device=corr.device, dtype=corr.dtype)
         scale = torch.full_like(corr, self.lambd)
         scale.fill_diagonal_(1.0)
         return (corr * scale - identity).square().sum()
-
