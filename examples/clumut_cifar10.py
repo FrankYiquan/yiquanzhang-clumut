@@ -353,7 +353,7 @@ def extract_features(encoder, loader, device):
 def linear_evaluate(
     encoder, train_loader, test_loader, device, epochs, log_every, pretrain_epoch, seed
 ):
-    """Train a linear classifier on frozen features and periodically report accuracy."""
+    """Train a linear classifier on frozen features and periodically report metrics."""
     if log_every < 1:
         raise ValueError("linear_eval_log_every must be positive")
     torch.manual_seed(seed)
@@ -370,11 +370,14 @@ def linear_evaluate(
     for epoch in range(epochs):
         classifier.train()
         permutation = torch.randperm(train_features.shape[0])
+        train_loss_sum = 0.0
         for indices in permutation.split(train_loader.batch_size):
             features = train_features[indices].to(device)
             labels = train_labels[indices].to(device)
             optimizer.zero_grad(set_to_none=True)
-            F.cross_entropy(classifier(features), labels).backward()
+            loss = F.cross_entropy(classifier(features), labels)
+            train_loss_sum += loss.item() * labels.size(0)
+            loss.backward()
             optimizer.step()
         scheduler.step()
 
@@ -396,6 +399,7 @@ def linear_evaluate(
             train_accuracy = calculate_accuracy(
                 train_features, train_labels, train_loader.batch_size
             )
+            train_loss = train_loss_sum / len(train_labels)
             test_accuracy = calculate_accuracy(
                 test_features, test_labels, test_loader.batch_size
             )
@@ -406,6 +410,7 @@ def linear_evaluate(
             print(
                 f"Pretraining epoch {pretrain_epoch} | "
                 f"linear eval epoch {epoch + 1}/{epochs}: "
+                f"train loss: {train_loss:.4f} | "
                 f"CIFAR-10 train top-1 accuracy: {train_accuracy:.4%} | "
                 f"test top-1 accuracy: {test_accuracy:.4%} | "
                 f"best so far: {best_accuracy:.4%} at epoch {best_epoch}"

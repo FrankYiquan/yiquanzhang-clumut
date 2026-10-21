@@ -341,5 +341,6 @@ def test_linear_evaluation_reports_train_and_test_accuracy(capsys):
     )
 
     output = capsys.readouterr().out
+    assert "train loss:" in output
     assert "CIFAR-10 train top-1 accuracy:" in output
     assert "test top-1 accuracy:" in output
