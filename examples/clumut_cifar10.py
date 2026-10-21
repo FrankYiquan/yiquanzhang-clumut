@@ -353,7 +353,7 @@ def extract_features(encoder, loader, device):
 def linear_evaluate(
     encoder, train_loader, test_loader, device, epochs, log_every, pretrain_epoch, seed
 ):
-    """Train a linear classifier on frozen features and periodically report test accuracy."""
+    """Train a linear classifier on frozen features and periodically report accuracy."""
     if log_every < 1:
         raise ValueError("linear_eval_log_every must be positive")
     torch.manual_seed(seed)
@@ -380,23 +380,34 @@ def linear_evaluate(
 
         if (epoch + 1) % log_every == 0 or epoch + 1 == epochs:
             classifier.eval()
-            correct = 0
-            with torch.no_grad():
-                for features, labels in zip(
-                    test_features.split(test_loader.batch_size),
-                    test_labels.split(test_loader.batch_size),
-                ):
-                    predictions = classifier(features.to(device)).argmax(dim=1).cpu()
-                    correct += (predictions == labels).sum().item()
-            accuracy = correct / len(test_labels)
-            final_accuracy = accuracy
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
+
+            def calculate_accuracy(features, labels, batch_size):
+                correct = 0
+                with torch.no_grad():
+                    for feature_batch, label_batch in zip(
+                        features.split(batch_size), labels.split(batch_size)
+                    ):
+                        predictions = (
+                            classifier(feature_batch.to(device)).argmax(dim=1).cpu()
+                        )
+                        correct += (predictions == label_batch).sum().item()
+                return correct / len(labels)
+
+            train_accuracy = calculate_accuracy(
+                train_features, train_labels, train_loader.batch_size
+            )
+            test_accuracy = calculate_accuracy(
+                test_features, test_labels, test_loader.batch_size
+            )
+            final_accuracy = test_accuracy
+            if test_accuracy > best_accuracy:
+                best_accuracy = test_accuracy
                 best_epoch = epoch + 1
             print(
                 f"Pretraining epoch {pretrain_epoch} | "
                 f"linear eval epoch {epoch + 1}/{epochs}: "
-                f"CIFAR-10 test top-1 accuracy: {accuracy:.4%} | "
+                f"CIFAR-10 train top-1 accuracy: {train_accuracy:.4%} | "
+                f"test top-1 accuracy: {test_accuracy:.4%} | "
                 f"best so far: {best_accuracy:.4%} at epoch {best_epoch}"
             )
 

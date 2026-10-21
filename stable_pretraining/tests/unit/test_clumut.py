@@ -1,6 +1,7 @@
 """Focused tests for CluMuT assignments, losses, and training integration."""
 
 import importlib.util
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -315,3 +316,72 @@ def test_lightning_training_step_runs_with_two_view_loader():
         model,
         train_dataloaders=DataLoader(_TwoViewDataset(), batch_size=4),
     )
+
+
+def test_barlow_optimizer_and_scheduler_integrate_with_clumut_training():
+    trainer = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_steps=2,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+        limit_val_batches=0,
+    )
+    model = CluMuT(
+        encoder_name=nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(3, 8)
+        ),
+        projector_dims=(8, 4),
+        n_prototypes=5,
+        optim={
+            "optimizer": partial(_example.BarlowLARS, base_lr=0.5, weight_decay=1e-4),
+            "scheduler": partial(
+                _example.BarlowWarmupCosineLR,
+                warmup_steps=1,
+                max_steps=2,
+                base_lr=0.5,
+            ),
+            "interval": "step",
+        },
+    )
+
+    trainer.fit(
+        model,
+        train_dataloaders=DataLoader(_TwoViewDataset(), batch_size=4),
+    )
+
+    assert len(trainer.optimizers[0].param_groups) == 2
+    assert all(
+        torch.isfinite(torch.tensor(group["lr"]))
+        for group in trainer.optimizers[0].param_groups
+    )
+
+
+def test_linear_evaluation_reports_train_and_test_accuracy(capsys):
+    train_loader = DataLoader(
+        [
+            {"image": torch.tensor([1.0, 0.0]), "label": 0},
+            {"image": torch.tensor([0.0, 1.0]), "label": 1},
+        ],
+        batch_size=2,
+    )
+    test_loader = DataLoader(
+        [{"image": torch.tensor([1.0, 0.0]), "label": 0}], batch_size=1
+    )
+
+    _example.linear_evaluate(
+        nn.Identity(),
+        train_loader,
+        test_loader,
+        torch.device("cpu"),
+        epochs=1,
+        log_every=1,
+        pretrain_epoch=5,
+        seed=0,
+    )
+
+    output = capsys.readouterr().out
+    assert "CIFAR-10 train top-1 accuracy:" in output
+    assert "test top-1 accuracy:" in output
