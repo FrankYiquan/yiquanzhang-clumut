@@ -150,11 +150,22 @@ class CluMuTDiagnosticsCallback(pl.Callback):
         if not should_log:
             return
 
-        diagonal_mean = correlation.diagonal().mean().item()
-        off_diagonal_mask = ~torch.eye(
-            correlation.shape[0], device=correlation.device, dtype=torch.bool
-        )
-        off_diagonal_mean = correlation[off_diagonal_mask].abs().mean().item()
+        with torch.no_grad():
+            diag = correlation.diagonal()
+            off_mask = ~torch.eye(
+                correlation.shape[0], device=correlation.device, dtype=torch.bool
+            )
+            h_a_std = h_a.float().std().item()
+            h_b_std = h_b.float().std().item()
+            h_a_prototype_std = h_a.float().std(dim=0).mean().item()
+            h_b_prototype_std = h_b.float().std(dim=0).mean().item()
+            diagonal_mean = diag.mean().item()
+            diagonal_min = diag.min().item()
+            diagonal_max = diag.max().item()
+            off_diagonal = correlation[off_mask]
+            off_diagonal_mean = off_diagonal.abs().mean().item()
+            off_diagonal_min = off_diagonal.min().item()
+            off_diagonal_max = off_diagonal.max().item()
         gradient_norms = {
             name: squared_norm.sqrt().item()
             for name, squared_norm in self.gradient_squared_norms.items()
@@ -165,11 +176,16 @@ class CluMuTDiagnosticsCallback(pl.Callback):
             f"identitization={identitization.item():.6g} total={total.item():.6g} "
             f"h_a={tuple(h_a.shape)} h_b={tuple(h_b.shape)} "
             f"q_a={tuple(q_a.shape)} q_b={tuple(q_b.shape)} "
+            f"h_a_std={h_a_std:.6f} h_b_std={h_b_std:.6f} "
+            f"h_a_mean_prototype_std={h_a_prototype_std:.6f} "
+            f"h_b_mean_prototype_std={h_b_prototype_std:.6f} "
             f"q_a_range=({q_a.min().item():.4g},{q_a.max().item():.4g}) "
             f"q_b_range=({q_b.min().item():.4g},{q_b.max().item():.4g}) "
             f"entropy=({entropy_a.mean().item():.4g},{entropy_b.mean().item():.4g}) "
-            f"corr_diag={diagonal_mean:.4g} "
+            f"corr_diag_mean={diagonal_mean:.6f} "
+            f"corr_diag_minmax={diagonal_min:.6f}/{diagonal_max:.6f} "
             f"corr_offdiag_abs={off_diagonal_mean:.4g} "
+            f"corr_offdiag_minmax={off_diagonal_min:.6f}/{off_diagonal_max:.6f} "
             f"grad_norms={gradient_norms}"
         )
 

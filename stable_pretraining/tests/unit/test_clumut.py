@@ -163,7 +163,10 @@ def test_diagnostics_report_losses_shapes_assignments_correlation_and_gradients(
     assert "epoch=1 step=1" in logged
     assert "mutual=" in logged and "identitization=" in logged and "total=" in logged
     assert "h_a=(4, 5)" in logged and "q_b=(4, 5)" in logged
-    assert "corr_diag=" in logged and "corr_offdiag_abs=" in logged
+    assert "h_a_std=" in logged and "h_a_mean_prototype_std=" in logged
+    assert "corr_diag_mean=" in logged and "corr_diag_minmax=" in logged
+    assert "corr_offdiag_abs=" in logged
+    assert "corr_offdiag_minmax=" in logged
     assert "grad_norms={" in logged
     assert "'projector':" in logged and "'prototypes':" in logged
 
