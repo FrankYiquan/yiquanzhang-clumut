@@ -315,3 +315,31 @@ def test_lightning_training_step_runs_with_two_view_loader():
         model,
         train_dataloaders=DataLoader(_TwoViewDataset(), batch_size=4),
     )
+
+
+def test_linear_evaluation_reports_train_and_test_accuracy(capsys):
+    train_loader = DataLoader(
+        [
+            {"image": torch.tensor([1.0, 0.0]), "label": 0},
+            {"image": torch.tensor([0.0, 1.0]), "label": 1},
+        ],
+        batch_size=2,
+    )
+    test_loader = DataLoader(
+        [{"image": torch.tensor([1.0, 0.0]), "label": 0}], batch_size=1
+    )
+
+    _example.linear_evaluate(
+        nn.Identity(),
+        train_loader,
+        test_loader,
+        torch.device("cpu"),
+        epochs=1,
+        log_every=1,
+        pretrain_epoch=5,
+        seed=0,
+    )
+
+    output = capsys.readouterr().out
+    assert "CIFAR-10 train top-1 accuracy:" in output
+    assert "test top-1 accuracy:" in output
