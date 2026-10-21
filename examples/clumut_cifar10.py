@@ -5,6 +5,8 @@ Use ``--max-epochs 1 --limit-train-batches 5`` for a short smoke run.
 """
 
 import argparse
+import math
+import random
 import re
 from functools import partial
 from pathlib import Path
@@ -13,6 +15,7 @@ import lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import ImageFilter, ImageOps
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -20,17 +23,157 @@ import stable_pretraining as spt
 
 
 class TwoViewTransform:
-    """Apply the same augmentation pipeline independently to two views."""
+    """Apply two augmentation pipelines to separate views of one image."""
 
-    def __init__(self, transform):
+    def __init__(self, transform, transform_prime):
         self.transform = transform
+        self.transform_prime = transform_prime
 
     def __call__(self, sample):
         image = sample["image"]
         return {
-            "views": (self.transform(image), self.transform(image)),
+            "views": (self.transform(image), self.transform_prime(image)),
             "label": sample["label"],
         }
+
+
+class GaussianBlur:
+    """Apply Barlow Twins-style Gaussian blur to a PIL image probabilistically."""
+
+    def __init__(self, probability: float):
+        self.probability = probability
+
+    def __call__(self, image):
+        if random.random() < self.probability:
+            return image.filter(ImageFilter.GaussianBlur(random.random() * 1.9 + 0.1))
+        return image
+
+
+class Solarization:
+    """Apply Barlow Twins-style PIL solarization probabilistically."""
+
+    def __init__(self, probability: float):
+        self.probability = probability
+
+    def __call__(self, image):
+        if random.random() < self.probability:
+            return ImageOps.solarize(image)
+        return image
+
+
+class BarlowLARS(torch.optim.Optimizer):
+    """LARS optimizer and weight/bias parameter groups from Barlow Twins."""
+
+    def __init__(
+        self,
+        params,
+        base_lr: float,
+        learning_rate_weights: float = 0.2,
+        learning_rate_biases: float = 0.0048,
+        weight_decay: float = 1e-4,
+        momentum: float = 0.9,
+        eta: float = 0.001,
+    ):
+        parameters = list(params)
+        weight_parameters = [
+            parameter for parameter in parameters if parameter.ndim != 1
+        ]
+        bias_parameters = [parameter for parameter in parameters if parameter.ndim == 1]
+        groups = [
+            {
+                "params": weight_parameters,
+                "lr": base_lr * learning_rate_weights,
+                "lr_multiplier": learning_rate_weights,
+            },
+            {
+                "params": bias_parameters,
+                "lr": base_lr * learning_rate_biases,
+                "lr_multiplier": learning_rate_biases,
+            },
+        ]
+        defaults = dict(
+            lr=0.0,
+            base_lr=base_lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            eta=eta,
+            weight_decay_filter=True,
+            lars_adaptation_filter=True,
+        )
+        super().__init__(groups, defaults)
+
+    @staticmethod
+    def exclude_bias_and_norm(parameter):
+        return parameter.ndim == 1
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for parameter in group["params"]:
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+
+                if not group["weight_decay_filter"] or not self.exclude_bias_and_norm(
+                    parameter
+                ):
+                    gradient = gradient.add(parameter, alpha=group["weight_decay"])
+
+                if not group[
+                    "lars_adaptation_filter"
+                ] or not self.exclude_bias_and_norm(parameter):
+                    parameter_norm = torch.norm(parameter)
+                    update_norm = torch.norm(gradient)
+                    one = torch.ones_like(parameter_norm)
+                    adaptation = torch.where(
+                        parameter_norm > 0,
+                        torch.where(
+                            update_norm > 0,
+                            group["eta"] * parameter_norm / update_norm,
+                            one,
+                        ),
+                        one,
+                    )
+                    gradient = gradient.mul(adaptation)
+
+                state = self.state[parameter]
+                if "mu" not in state:
+                    state["mu"] = torch.zeros_like(parameter)
+                momentum = state["mu"]
+                momentum.mul_(group["momentum"]).add_(gradient)
+                parameter.add_(momentum, alpha=-group["lr"])
+
+        return loss
+
+
+class BarlowWarmupCosineLR(torch.optim.lr_scheduler.LRScheduler):
+    """Batch-scaled Barlow Twins warmup and cosine learning-rate schedule."""
+
+    def __init__(self, optimizer, warmup_steps: int, max_steps: int, base_lr: float):
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.base_lr = base_lr
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        step = self.last_epoch
+        if step < self.warmup_steps:
+            scale = step / max(1, self.warmup_steps)
+        else:
+            progress = min(
+                1.0,
+                (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps),
+            )
+            scale = 0.001 + 0.999 * (1 + math.cos(math.pi * progress)) / 2
+        return [
+            self.base_lr * group["lr_multiplier"] * scale
+            for group in self.optimizer.param_groups
+        ]
 
 
 class SingleViewTransform:
@@ -298,14 +441,29 @@ def main():
         parser.error("--linear-eval-epochs must be positive with --encoder-checkpoint")
     pl.seed_everything(args.seed, workers=True)
 
+    shared_augmentations = [
+        transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+    ]
+    normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
     transform = transforms.Compose(
         [
-            transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
+            *shared_augmentations,
+            GaussianBlur(probability=1.0),
+            Solarization(probability=0.0),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
+            normalize,
+        ]
+    )
+    transform_prime = transforms.Compose(
+        [
+            *shared_augmentations,
+            GaussianBlur(probability=0.1),
+            Solarization(probability=0.2),
+            transforms.ToTensor(),
+            normalize,
         ]
     )
     evaluation_transform = transforms.Compose(
@@ -321,7 +479,7 @@ def main():
             split="train",
             cache_dir=args.data_root,
             rename_columns={"img": "image"},
-            transform=TwoViewTransform(transform),
+            transform=TwoViewTransform(transform, transform_prime),
         )
         loader = DataLoader(
             dataset,
@@ -334,21 +492,19 @@ def main():
         steps_per_epoch = len(loader)
         total_steps = max(2, steps_per_epoch * args.max_epochs)
         warmup_steps = min(steps_per_epoch * 10, total_steps - 1)
+        base_lr = args.batch_size / 256
         optim = {
             "optimizer": partial(
-                spt.optim.LARS,
-                lr=0.5,
-                momentum=0.9,
+                BarlowLARS,
+                base_lr=base_lr,
                 weight_decay=1e-4,
-                exclude_bias_n_norm=True,
             ),
-            "scheduler": {
-                "type": "LinearWarmupCosineAnnealingLR",
-                "warmup_steps": warmup_steps,
-                "max_steps": total_steps,
-                "warmup_start_lr": 0.0,
-                "eta_min": 0.0005,
-            },
+            "scheduler": partial(
+                BarlowWarmupCosineLR,
+                warmup_steps=warmup_steps,
+                max_steps=total_steps,
+                base_lr=base_lr,
+            ),
             "interval": "step",
         }
 

@@ -38,6 +38,70 @@ def _model() -> CluMuT:
     )
 
 
+def test_barlow_style_cifar_transform_produces_two_32_pixel_views():
+    from PIL import Image
+
+    base_augmentations = [
+        _example.transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
+        _example.transforms.RandomHorizontalFlip(),
+        _example.transforms.RandomApply(
+            [_example.transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8
+        ),
+        _example.transforms.RandomGrayscale(p=0.2),
+    ]
+    normalize = _example.transforms.Normalize(
+        (0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)
+    )
+    transform = _example.transforms.Compose(
+        [
+            *base_augmentations,
+            _example.GaussianBlur(probability=1.0),
+            _example.Solarization(probability=0.0),
+            _example.transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    transform_prime = _example.transforms.Compose(
+        [
+            *base_augmentations,
+            _example.GaussianBlur(probability=0.1),
+            _example.Solarization(probability=0.2),
+            _example.transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    sample = {
+        "image": Image.new("RGB", (32, 32), color=(100, 150, 200)),
+        "label": 3,
+    }
+
+    result = _example.TwoViewTransform(transform, transform_prime)(sample)
+
+    assert len(result["views"]) == 2
+    assert all(view.shape == (3, 32, 32) for view in result["views"])
+    assert result["label"] == 3
+
+
+def test_barlow_lars_groups_and_cosine_schedule():
+    weight = nn.Parameter(torch.ones(2, 2))
+    bias = nn.Parameter(torch.ones(2))
+    optimizer = _example.BarlowLARS([weight, bias], base_lr=0.5)
+
+    assert [group["lr"] for group in optimizer.param_groups] == [0.1, 0.0024]
+    assert [group["lr_multiplier"] for group in optimizer.param_groups] == [
+        0.2,
+        0.0048,
+    ]
+
+    scheduler = _example.BarlowWarmupCosineLR(
+        optimizer, warmup_steps=10, max_steps=100, base_lr=0.5
+    )
+    scheduler.last_epoch = 10
+    assert scheduler.get_lr() == [0.1, 0.0024]
+    scheduler.last_epoch = 100
+    assert scheduler.get_lr() == pytest.approx([0.0001, 0.0000024])
+
+
 def test_assignments_and_loss_gradients_reach_encoder_and_prototypes():
     torch.manual_seed(0)
     model = _model()
