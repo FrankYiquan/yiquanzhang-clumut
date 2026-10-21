@@ -338,9 +338,29 @@ def test_linear_evaluation_reports_train_and_test_accuracy(capsys):
         log_every=1,
         pretrain_epoch=5,
         seed=0,
+        classifier_lr=0.01,
+        diagnostics=True,
     )
 
     output = capsys.readouterr().out
+    assert "Linear eval feature diagnostic split=train" in output
+    assert "mean_per_feature_std=" in output
+    assert "sample_pairwise_cosine_mean/std/min/max=" in output
+    assert "stage=before first optimizer update" in output
+    assert "stage=after first optimizer update" in output
+    assert "Linear eval gradient diagnostic" in output
+    assert "Linear eval final-state diagnostic" in output
     assert "train loss:" in output
     assert "CIFAR-10 train top-1 accuracy:" in output
     assert "test top-1 accuracy:" in output
+
+
+def test_linear_eval_rejects_misaligned_features_and_invalid_labels():
+    with pytest.raises(ValueError, match="feature/label count mismatch"):
+        _example._validate_linear_eval_data(
+            "train", torch.randn(2, 3), torch.tensor([0])
+        )
+    with pytest.raises(ValueError, match="labels must be in"):
+        _example._validate_linear_eval_data(
+            "test", torch.randn(2, 3), torch.tensor([0, 10])
+        )

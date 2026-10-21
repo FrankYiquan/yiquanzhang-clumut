@@ -350,8 +350,99 @@ def extract_features(encoder, loader, device):
     return torch.cat(features), torch.cat(labels)
 
 
+def _validate_linear_eval_data(split, features, labels):
+    if features.ndim != 2 or labels.ndim != 1:
+        raise ValueError(
+            f"{split} features/labels must have shapes [N, D] and [N], "
+            f"got {tuple(features.shape)} and {tuple(labels.shape)}"
+        )
+    if features.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"{split} feature/label count mismatch: "
+            f"{features.shape[0]} features, {labels.shape[0]} labels"
+        )
+    integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+    if labels.dtype not in integer_dtypes:
+        raise ValueError(
+            f"{split} labels must be integer class indices, got {labels.dtype}"
+        )
+    if labels.numel() and (labels.min() < 0 or labels.max() > 9):
+        raise ValueError(f"{split} labels must be in [0, 9]")
+    if not torch.isfinite(features).all():
+        raise ValueError(f"{split} encoder features contain non-finite values")
+
+
+def _log_linear_eval_feature_diagnostics(split, features, labels):
+    """Log feature scale, variance, norms, cosine similarity, and label counts."""
+    with torch.no_grad():
+        values = features.detach().float()
+        norms = torch.linalg.vector_norm(values, dim=1)
+        sample = values[: min(values.shape[0], 256)]
+        normalized_sample = F.normalize(sample, dim=1)
+        cosine = normalized_sample @ normalized_sample.T
+        off_diagonal_mask = ~torch.eye(cosine.shape[0], dtype=torch.bool)
+        off_diagonal_cosine = cosine[off_diagonal_mask]
+        class_counts = torch.bincount(labels.long(), minlength=10).tolist()
+        if off_diagonal_cosine.numel():
+            cosine_summary = (
+                f"{off_diagonal_cosine.mean().item():.6g}/"
+                f"{off_diagonal_cosine.std(unbiased=False).item():.6g}/"
+                f"{off_diagonal_cosine.min().item():.6g}/"
+                f"{off_diagonal_cosine.max().item():.6g}"
+            )
+        else:
+            cosine_summary = "n/a"
+        print(
+            f"Linear eval feature diagnostic split={split} "
+            f"shape={tuple(features.shape)} dtype={features.dtype} "
+            f"mean={values.mean().item():.6g} std={values.std(unbiased=False).item():.6g} "
+            f"min={values.min().item():.6g} max={values.max().item():.6g} "
+            f"max_abs={values.abs().max().item():.6g} "
+            f"finite={torch.isfinite(values).all().item()} "
+            f"mean_per_feature_std={values.std(dim=0, unbiased=False).mean().item():.6g} "
+            f"feature_norm_mean/min/max="
+            f"{norms.mean().item():.6g}/{norms.min().item():.6g}/"
+            f"{norms.max().item():.6g} "
+            f"sample_pairwise_cosine_mean/std/min/max="
+            f"{cosine_summary} "
+            f"count={features.shape[0]} label_count={labels.shape[0]} "
+            f"label_dtype={labels.dtype} label_min/max="
+            f"{labels.min().item()}/{labels.max().item()} "
+            f"class_counts={class_counts}"
+        )
+
+
+def _log_linear_eval_classifier_diagnostics(stage, logits, loss, classifier):
+    """Log detached classifier output and parameter statistics."""
+    with torch.no_grad():
+        values = logits.detach().float()
+        weight_norm = classifier.weight.detach().float().norm().item()
+        bias_norm = classifier.bias.detach().float().norm().item()
+        print(
+            f"Linear eval classifier diagnostic stage={stage} "
+            f"logits_shape={tuple(values.shape)} dtype={logits.dtype} "
+            f"logits_mean={values.mean().item():.6g} "
+            f"logits_std={values.std(unbiased=False).item():.6g} "
+            f"logits_min={values.min().item():.6g} "
+            f"logits_max={values.max().item():.6g} "
+            f"logits_max_abs={values.abs().max().item():.6g} "
+            f"logits_finite={torch.isfinite(values).all().item()} "
+            f"cross_entropy={loss.detach().item():.6g} "
+            f"weight_norm={weight_norm:.6g} bias_norm={bias_norm:.6g}"
+        )
+
+
 def linear_evaluate(
-    encoder, train_loader, test_loader, device, epochs, log_every, pretrain_epoch, seed
+    encoder,
+    train_loader,
+    test_loader,
+    device,
+    epochs,
+    log_every,
+    pretrain_epoch,
+    seed,
+    classifier_lr=0.1,
+    diagnostics=False,
 ):
     """Train a linear classifier on frozen features and periodically report metrics."""
     if log_every < 1:
@@ -360,47 +451,120 @@ def linear_evaluate(
     encoder.requires_grad_(False)
     train_features, train_labels = extract_features(encoder, train_loader, device)
     test_features, test_labels = extract_features(encoder, test_loader, device)
+    _validate_linear_eval_data("train", train_features, train_labels)
+    _validate_linear_eval_data("test", test_features, test_labels)
+    if train_features.shape[1] != test_features.shape[1]:
+        raise ValueError(
+            "Train and test encoder feature dimensions differ: "
+            f"{train_features.shape[1]} vs {test_features.shape[1]}"
+        )
+    if diagnostics:
+        print(
+            "Linear eval data pipeline: train/test share the deterministic "
+            "ToTensor+Normalize transform; features and labels are appended "
+            "together in non-shuffled loader order."
+        )
+        _log_linear_eval_feature_diagnostics("train", train_features, train_labels)
+        _log_linear_eval_feature_diagnostics("test", test_features, test_labels)
     classifier = nn.Linear(train_features.shape[1], 10).to(device)
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1, momentum=0.9)
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=classifier_lr, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     best_accuracy = 0.0
     best_epoch = 0
     final_accuracy = None
 
+    global_step = 0
+    total_train_steps = epochs * math.ceil(
+        train_features.shape[0] / train_loader.batch_size
+    )
+    final_gradient_norms = None
     for epoch in range(epochs):
         classifier.train()
         permutation = torch.randperm(train_features.shape[0])
-        train_loss_sum = 0.0
-        for indices in permutation.split(train_loader.batch_size):
+        for batch_index, indices in enumerate(
+            permutation.split(train_loader.batch_size)
+        ):
+            global_step += 1
             features = train_features[indices].to(device)
             labels = train_labels[indices].to(device)
+            if diagnostics and global_step == 1:
+                with torch.no_grad():
+                    initial_logits = classifier(features)
+                    initial_loss = F.cross_entropy(initial_logits, labels)
+                _log_linear_eval_classifier_diagnostics(
+                    "before first optimizer update",
+                    initial_logits,
+                    initial_loss,
+                    classifier,
+                )
             optimizer.zero_grad(set_to_none=True)
             loss = F.cross_entropy(classifier(features), labels)
-            train_loss_sum += loss.item() * labels.size(0)
             loss.backward()
+            should_log_gradient = (
+                global_step <= 3
+                or global_step % 100 == 0
+                or global_step == total_train_steps
+            )
+            if diagnostics and should_log_gradient:
+                weight_gradient_norm = (
+                    classifier.weight.grad.detach().float().norm().item()
+                )
+                bias_gradient_norm = classifier.bias.grad.detach().float().norm().item()
+                final_gradient_norms = {
+                    "weight": weight_gradient_norm,
+                    "bias": bias_gradient_norm,
+                }
+                print(
+                    f"Linear eval gradient diagnostic epoch={epoch + 1} "
+                    f"step={global_step} batch={batch_index} "
+                    f"loss={loss.detach().item():.6g} "
+                    f"weight_grad_norm={weight_gradient_norm:.6g} "
+                    f"bias_grad_norm={bias_gradient_norm:.6g}"
+                )
             optimizer.step()
+            if diagnostics and global_step == 1:
+                with torch.no_grad():
+                    updated_logits = classifier(features)
+                    updated_loss = F.cross_entropy(updated_logits, labels)
+                _log_linear_eval_classifier_diagnostics(
+                    "after first optimizer update",
+                    updated_logits,
+                    updated_loss,
+                    classifier,
+                )
         scheduler.step()
 
         if (epoch + 1) % log_every == 0 or epoch + 1 == epochs:
             classifier.eval()
 
-            def calculate_accuracy(features, labels, batch_size):
+            def evaluate_split(features, labels, batch_size):
                 correct = 0
+                total_loss = 0.0
+                max_abs_logit = 0.0
                 with torch.no_grad():
                     for feature_batch, label_batch in zip(
                         features.split(batch_size), labels.split(batch_size)
                     ):
-                        predictions = (
-                            classifier(feature_batch.to(device)).argmax(dim=1).cpu()
-                        )
+                        logits = classifier(feature_batch.to(device))
+                        target = label_batch.to(device)
+                        loss = F.cross_entropy(logits, target, reduction="sum")
+                        if not torch.isfinite(logits).all() or not torch.isfinite(loss):
+                            raise ValueError(
+                                "Linear probe produced non-finite logits/loss"
+                            )
+                        total_loss += loss.item()
+                        if diagnostics:
+                            max_abs_logit = max(
+                                max_abs_logit, logits.detach().abs().max().item()
+                            )
+                        predictions = logits.argmax(dim=1).cpu()
                         correct += (predictions == label_batch).sum().item()
-                return correct / len(labels)
+                return total_loss / len(labels), correct / len(labels), max_abs_logit
 
-            train_accuracy = calculate_accuracy(
+            train_loss, train_accuracy, train_max_abs_logit = evaluate_split(
                 train_features, train_labels, train_loader.batch_size
             )
-            train_loss = train_loss_sum / len(train_labels)
-            test_accuracy = calculate_accuracy(
+            test_loss, test_accuracy, test_max_abs_logit = evaluate_split(
                 test_features, test_labels, test_loader.batch_size
             )
             final_accuracy = test_accuracy
@@ -409,12 +573,21 @@ def linear_evaluate(
                 best_epoch = epoch + 1
             print(
                 f"Pretraining epoch {pretrain_epoch} | "
-                f"linear eval epoch {epoch + 1}/{epochs}: "
-                f"train loss: {train_loss:.4f} | "
+                f"linear eval epoch {epoch + 1}/{epochs} lr={classifier_lr:g}: "
+                f"train loss: {train_loss:.6g} | test loss: {test_loss:.6g} | "
                 f"CIFAR-10 train top-1 accuracy: {train_accuracy:.4%} | "
                 f"test top-1 accuracy: {test_accuracy:.4%} | "
                 f"best so far: {best_accuracy:.4%} at epoch {best_epoch}"
             )
+            if diagnostics:
+                print(
+                    f"Linear eval final-state diagnostic epoch={epoch + 1} "
+                    f"train_logits_max_abs={train_max_abs_logit:.6g} "
+                    f"test_logits_max_abs={test_max_abs_logit:.6g} "
+                    f"weight_norm={classifier.weight.detach().float().norm().item():.6g} "
+                    f"bias_norm={classifier.bias.detach().float().norm().item():.6g} "
+                    f"last_logged_grad_norms={final_gradient_norms}"
+                )
 
     if final_accuracy is not None:
         print(
@@ -432,6 +605,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--linear-eval-epochs", type=int, default=100)
     parser.add_argument("--linear-eval-log-every", type=int, default=10)
+    parser.add_argument("--linear-eval-lr", type=float, default=0.1)
+    parser.add_argument(
+        "--linear-eval-diagnostics",
+        action="store_true",
+        help="Log frozen-feature, classifier-logit, loss, and gradient diagnostics.",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--checkpoint-dir", default="./clumut_checkpoints")
     parser.add_argument(
@@ -455,6 +634,8 @@ def main():
         parser.error("--checkpoint-every must be positive")
     if args.encoder_checkpoint and args.linear_eval_epochs < 1:
         parser.error("--linear-eval-epochs must be positive with --encoder-checkpoint")
+    if args.linear_eval_lr <= 0:
+        parser.error("--linear-eval-lr must be positive")
     pl.seed_everything(args.seed, workers=True)
 
     shared_augmentations = [
@@ -574,6 +755,12 @@ def main():
 
     if args.linear_eval_epochs > 0:
         linear_transform = SingleViewTransform(evaluation_transform)
+        if args.linear_eval_diagnostics:
+            print(
+                "Linear-eval dataset validation: train and test use the same "
+                "SingleViewTransform and deterministic evaluation transform; "
+                "both loaders use shuffle=False."
+            )
         linear_train = spt.data.HFDataset(
             "uoft-cs/cifar10",
             split="train",
@@ -610,7 +797,11 @@ def main():
             encoder_state = torch.load(
                 checkpoint_path, map_location="cpu", weights_only=True
             )
-            model.backbone.load_state_dict(encoder_state)
+            model.backbone.load_state_dict(encoder_state, strict=True)
+            print(
+                f"Loaded encoder checkpoint strictly: {checkpoint_path} "
+                f"({len(encoder_state)} state entries)"
+            )
             linear_evaluate(
                 model.backbone,
                 train_eval_loader,
@@ -620,6 +811,8 @@ def main():
                 args.linear_eval_log_every,
                 pretrain_epoch,
                 args.seed,
+                classifier_lr=args.linear_eval_lr,
+                diagnostics=args.linear_eval_diagnostics,
             )
 
 
