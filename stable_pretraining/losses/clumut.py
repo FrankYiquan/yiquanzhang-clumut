@@ -67,7 +67,18 @@ class CluMuTLoss(nn.Module):
     ) -> torch.Tensor:
         """Match scaled cluster cross-correlations to an identity matrix."""
         corr = self.correlation(h_a, h_b) if correlation is None else correlation
-        identity = torch.eye(corr.shape[0], device=corr.device, dtype=corr.dtype)
-        scale = torch.full_like(corr, self.lambd)
-        scale.fill_diagonal_(1.0)
-        return (corr * scale - identity).square().sum()
+        diagonal_loss, off_diagonal_loss = self.identitization_loss_components(corr)
+        return diagonal_loss + off_diagonal_loss
+
+    def identitization_loss_components(
+        self, correlation: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return diagonal and weighted off-diagonal objective contributions."""
+        diagonal_loss = (correlation.diagonal() - 1.0).square().sum()
+        off_diagonal_mask = ~torch.eye(
+            correlation.shape[0], device=correlation.device, dtype=torch.bool
+        )
+        off_diagonal_loss = (
+            correlation[off_diagonal_mask].square().sum() * self.lambd**2
+        )
+        return diagonal_loss, off_diagonal_loss

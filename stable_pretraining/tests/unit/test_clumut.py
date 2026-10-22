@@ -186,6 +186,22 @@ def test_identitization_is_finite_for_constant_dimensions_and_rejects_batch_one(
         loss.identitization_loss(torch.ones(1, 4), torch.ones(1, 4))
 
 
+def test_identitization_loss_components_sum_to_objective_and_apply_lambda_squared():
+    correlation = torch.tensor([[0.5, 0.2, -0.1], [0.3, 0.25, 0.4], [-0.2, 0.1, 0.75]])
+    loss = CluMuTLoss(lambd=0.005)
+
+    diagonal, off_diagonal = loss.identitization_loss_components(correlation)
+
+    expected_diagonal = (correlation.diagonal() - 1).square().sum()
+    mask = ~torch.eye(3, dtype=torch.bool)
+    expected_off_diagonal = correlation[mask].square().sum() * 0.005**2
+    assert torch.allclose(diagonal, expected_diagonal)
+    assert torch.allclose(off_diagonal, expected_off_diagonal)
+    assert torch.allclose(
+        loss.identitization_loss(None, None, correlation), diagonal + off_diagonal
+    )
+
+
 def test_framework_batch_dict_contract_returns_training_state():
     model = _model()
     batch = {"views": [torch.randn(4, 3, 16, 16), torch.randn(4, 3, 16, 16)]}
@@ -195,6 +211,11 @@ def test_framework_batch_dict_contract_returns_training_state():
     assert isinstance(state, dict)
     assert torch.isfinite(state["loss"])
     assert state["embedding"].shape == (8, 8)
+    assert torch.allclose(
+        state["identitization_loss"],
+        state["identitization_diagonal_loss"]
+        + state["identitization_off_diagonal_loss"],
+    )
 
 
 def test_diagnostics_report_losses_shapes_assignments_correlation_and_gradients(capsys):

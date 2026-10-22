@@ -625,6 +625,12 @@ def main():
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--lambd",
+        type=float,
+        default=1.0,
+        help="Off-diagonal correlation scale in the CluMuT identitization loss.",
+    )
+    parser.add_argument(
         "--diagnostics",
         action="store_true",
         help="Print loss, assignment, correlation, and gradient diagnostics.",
@@ -711,7 +717,7 @@ def main():
         projector_dims=(1024, 1024),
         n_prototypes=1024,
         temperature=0.1,
-        lambd=1.0,
+        lambd=args.lambd,
         optim=optim,
     )
     checkpoint_dir = Path(args.checkpoint_dir) / f"batch_size_{args.batch_size}"

@@ -36,6 +36,8 @@ class CluMuTOutput(ModelOutput):
     q_b: Optional[torch.Tensor] = None
     mutual_targeting_loss: Optional[torch.Tensor] = None
     identitization_loss: Optional[torch.Tensor] = None
+    identitization_diagonal_loss: Optional[torch.Tensor] = None
+    identitization_off_diagonal_loss: Optional[torch.Tensor] = None
     correlation: Optional[torch.Tensor] = None
 
 
@@ -164,8 +166,11 @@ class CluMuT(Module):
             h_b, q_b = self._assign(projection_b)
             correlation = self.clumut_loss.correlation(h_a, h_b)
             mutual_loss = self.clumut_loss.mutual_targeting_loss(q_a, q_b)
-            identitization_loss = self.clumut_loss.identitization_loss(
-                h_a, h_b, correlation=correlation
+            identitization_diagonal_loss, identitization_off_diagonal_loss = (
+                self.clumut_loss.identitization_loss_components(correlation)
+            )
+            identitization_loss = (
+                identitization_diagonal_loss + identitization_off_diagonal_loss
             )
             loss = mutual_loss + identitization_loss
             output = CluMuTOutput(
@@ -178,6 +183,8 @@ class CluMuT(Module):
                 q_b=q_b,
                 mutual_targeting_loss=mutual_loss,
                 identitization_loss=identitization_loss,
+                identitization_diagonal_loss=identitization_diagonal_loss,
+                identitization_off_diagonal_loss=identitization_off_diagonal_loss,
                 correlation=correlation,
             )
 
@@ -198,6 +205,18 @@ class CluMuT(Module):
                 on_step=True,
                 on_epoch=True,
             )
+            self.log(
+                "train/identitization_diagonal_loss",
+                output.identitization_diagonal_loss,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log(
+                "train/identitization_off_diagonal_loss",
+                output.identitization_off_diagonal_loss,
+                on_step=True,
+                on_epoch=True,
+            )
         return {
             **batch,
             "loss": output.loss,
@@ -209,5 +228,7 @@ class CluMuT(Module):
             "q_b": output.q_b,
             "mutual_targeting_loss": output.mutual_targeting_loss,
             "identitization_loss": output.identitization_loss,
+            "identitization_diagonal_loss": output.identitization_diagonal_loss,
+            "identitization_off_diagonal_loss": output.identitization_off_diagonal_loss,
             "correlation": output.correlation,
         }
