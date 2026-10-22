@@ -208,7 +208,15 @@ def extract_features(encoder, loader, device):
 
 
 def linear_evaluate(
-    encoder, train_loader, test_loader, device, epochs, log_every, pretrain_epoch, seed
+    encoder,
+    train_loader,
+    test_loader,
+    device,
+    epochs,
+    log_every,
+    pretrain_epoch,
+    seed,
+    classifier_lr,
 ):
     """Train a linear classifier on frozen features and periodically report test accuracy."""
     if log_every < 1:
@@ -218,7 +226,7 @@ def linear_evaluate(
     train_features, train_labels = extract_features(encoder, train_loader, device)
     test_features, test_labels = extract_features(encoder, test_loader, device)
     classifier = nn.Linear(train_features.shape[1], 10).to(device)
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1, momentum=0.9)
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=classifier_lr, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     best_accuracy = 0.0
     best_epoch = 0
@@ -273,6 +281,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--linear-eval-epochs", type=int, default=100)
     parser.add_argument("--linear-eval-log-every", type=int, default=10)
+    parser.add_argument("--linear-eval-lr", type=float, default=0.01)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--checkpoint-dir", default="./clumut_checkpoints")
     parser.add_argument(
@@ -300,6 +309,8 @@ def main():
     args = parser.parse_args()
     if args.checkpoint_every < 1:
         parser.error("--checkpoint-every must be positive")
+    if args.linear_eval_lr <= 0:
+        parser.error("--linear-eval-lr must be positive")
     if args.encoder_checkpoint and args.linear_eval_epochs < 1:
         parser.error("--linear-eval-epochs must be positive with --encoder-checkpoint")
     pl.seed_everything(args.seed, workers=True)
@@ -454,6 +465,7 @@ def main():
                 args.linear_eval_log_every,
                 pretrain_epoch,
                 args.seed,
+                args.linear_eval_lr,
             )
 
 
