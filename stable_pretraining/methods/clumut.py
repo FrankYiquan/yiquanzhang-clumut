@@ -210,6 +210,7 @@ class CluMuT(Module):
                 output.identitization_diagonal_loss,
                 on_step=True,
                 on_epoch=True,
+                
             )
             self.log(
                 "train/identitization_off_diagonal_loss",
